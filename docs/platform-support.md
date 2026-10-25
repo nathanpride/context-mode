@@ -234,13 +234,33 @@ Entries may be a bare string or a `{ "package": "...", "options": { ... } }` obj
 
 V2's plugin-tool permission model is **coarser than V1's per-call hooks**. Be aware of what context-mode does and does not provide on V2:
 
-- The host creates **no per-call permission request** for plugin tools. There is **no host `ask`** for `ctx_*` calls.
-- **No granular-bash parity** and **no external-directory scoping** for sandboxed ctx tools — the sandbox runs with the plugin process's own filesystem/network reach, not a host-mediated grant.
-- The **only** host-side lever is a blanket deny: a `permission` rule of `resource:"*"` + `effect:"deny"` (`whollyDisabled`) removes the tool entirely.
-- context-mode's single in-plugin lever is `permission: "bash"` on `ctx_execute` / `ctx_execute_file` / `ctx_batch_execute`, which routes those through the host's bash permission bucket.
-- **Trust boundary is plugin installation, not per-call.** Installing `context-mode` trusts it to run code in-process. Do not install it in a tree you do not trust.
+- The host creates **no per-call permission request** for plugin tools on its own and performs **no per-call evaluation** of them. There is no automatic host `ask` for `ctx_*` calls.
+- Since host #54930 the host does expose **rule evaluation** to plugin tools (`ctx.permission.assert`): it evaluates the session's rules and prompts only when a rule says `ask`. The default agent ruleset allows everything, so an assertion is silent under default config. context-mode uses it for destructive tools only (below).
+- **No granular-bash parity** and **no external-directory scoping** for sandboxed ctx tools — the sandbox runs with the plugin process's own filesystem/network reach, not a host-mediated grant. context-mode deliberately does not assert `bash` on the sandbox tools' behalf.
+- The host-side **visibility** lever is a blanket deny: a `permission` rule of `resource:"*"` + `effect:"deny"` (`whollyDisabled`) removes the tool entirely. A granular rule (e.g. `bash: { "rm *": "deny" }`) neither hides the ctx execute tools nor affects their commands.
+- context-mode's in-plugin lever for the execute family is `permission: "bash"` on `ctx_execute` / `ctx_execute_file` / `ctx_batch_execute`, which routes those through the host's bash permission bucket (visibility only).
+- **Trust boundary is plugin installation, not per-call.** Installing `context-mode` trusts it to run code in-process. Do not install it in a tree you do not trust. Note also that the host's `permission.evaluate` hook exposes a **mutable effect any installed plugin may change for any evaluation** — a plugin can auto-allow (or auto-deny) prompts raised for host tools — so per-call prompts are advisory against hostile plugins and installation remains the real boundary.
 
-**Destructive-tool policy (V2 only):** `ctx_purge` and `ctx_upgrade` are **refused by default**. They throw a context-mode-attributed error (`disabled by context-mode policy … not a host permission denial`). Set `CONTEXT_MODE_ALLOW_DESTRUCTIVE=1` (or `true`/`yes`) to enable them. The CLI (`context-mode upgrade`) remains the supported upgrade/purge path.
+**Destructive-tool policy (V2 only):** `ctx_purge` and `ctx_upgrade` are **refused by default** with a context-mode-attributed error (`disabled by context-mode policy … not a host permission denial`). The policy is layered and host rules can only **tighten** it, never loosen it:
+
+| `CONTEXT_MODE_ALLOW_DESTRUCTIVE` | your `context-mode` rule | outcome |
+|---|---|---|
+| unset | any | refused by context-mode policy (host rules never consulted) |
+| `1`/`true`/`yes` | none / wildcard / `allow` | runs |
+| `1`/`true`/`yes` | `deny` | refused — refusal attributed to your permission rule |
+| `1`/`true`/`yes` | `ask` | real host prompt; approve → runs, decline → failed tool call |
+| `1`/`true`/`yes` | `ask` in a headless run | host auto-rejects → refused (no hang) |
+
+Rule surface — add entries to the `permissions` array in your opencode config (each rule is `{ action, resource, effect }`):
+
+```json
+"permissions": [
+  { "action": "context-mode", "resource": "ctx_purge", "effect": "deny" },
+  { "action": "context-mode", "resource": "ctx_upgrade", "effect": "ask" }
+]
+```
+
+Replying "always allow" at an `ask` prompt saves one `{ "action": "context-mode", "resource": "*", "effect": "allow" }` rule, after which the tool runs without prompting. Hosts predating #54930 have no rule surface for plugin tools: there, the env var alone decides. The CLI (`context-mode upgrade`) remains the supported upgrade/purge path.
 
 **Upgrade / key migration:** `context-mode upgrade` resolves the target in this order:
 1. explicit `--v2` / `--opencode2` flag → V2
