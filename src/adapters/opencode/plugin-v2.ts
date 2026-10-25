@@ -31,6 +31,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import type { Plugin } from "@opencode/plugin";
+import type { Session } from "@opencode/schema/session";
 import z from "zod/v4";
 
 import { getCore, detectPlatform, type ContextModeCore } from "./core.js";
@@ -39,29 +40,126 @@ import { parseOpencodeV2StepUsage, buildAgentUsageEvent } from "../../session/ex
 
 /**
  * The three sandbox-execute tools borrow the host `bash` action so a blanket
- * `bash: { "*": "deny" }` hides them from the model. This is visibility only —
- * the host performs no per-call evaluation of plugin tools (see the permission
- * posture spec).
+ * `bash: { "*": "deny" }` hides them from the model. This is visibility only:
+ * the host performs no per-call evaluation of plugin tools, and the adapter
+ * deliberately does not assert `bash` on their behalf. Host assertion exists
+ * (since host #54930), but an assertion cannot distinguish a wildcard allow
+ * from an explicit one, so granular bash parity cannot be built on it —
+ * see the permission posture spec.
  */
 const BASH_PERMISSION_TOOLS = new Set(["ctx_execute", "ctx_execute_file", "ctx_batch_execute"]);
 
 /**
- * Destructive tools the v2 host cannot gate per call. Because a plugin tool cannot
- * raise a host permission request, context-mode owns their in-execute policy: they
- * are refused by default and only run when the user explicitly opts in. The
- * refusal is attributed to context-mode policy, never to a host permission denial.
+ * Destructive tools under context-mode's own default-refusal policy. Since
+ * host #54930 the host CAN evaluate permission rules for plugin tools via
+ * `ctx.permission.assert`, so the policy is layered: context-mode refuses by
+ * default (layer 1), and the env-var pre-approval opens the call to the
+ * user's host permission rules (layer 2), which can tighten but never loosen
+ * the default refusal.
  */
 const DESTRUCTIVE_TOOLS = new Set(["ctx_purge", "ctx_upgrade"]);
 
 /**
- * Context-mode-owned destructive-tool policy. Returns true when a destructive
- * tool may run. Opt-in via `CONTEXT_MODE_ALLOW_DESTRUCTIVE` (1/true/yes); unset
- * means refused. Non-destructive tools are always allowed.
+ * Host permission action namespace for context-mode rules (design D1):
+ * `{ "action": "context-mode", "resource": "ctx_purge", "effect": "deny" }`
+ * entries in the config `permissions` array.
+ */
+const PERMISSION_ACTION = "context-mode";
+
+/**
+ * Layer 1 of the destructive-tool policy: context-mode's own default refusal.
+ * Returns true when a destructive tool is pre-approved to run. Opt-in via
+ * `CONTEXT_MODE_ALLOW_DESTRUCTIVE` (1/true/yes); unset means refused.
+ * Non-destructive tools are always allowed. Pre-approval does NOT bypass the
+ * user's host permission rules — see `guardDestructiveTool`.
  */
 function destructivePolicyAllows(name: string): boolean {
   if (!DESTRUCTIVE_TOOLS.has(name)) return true;
   const flag = (process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE ?? "").trim().toLowerCase();
   return flag === "1" || flag === "true" || flag === "yes";
+}
+
+/**
+ * Translate a `ctx.permission.assert` rejection into a tool error with correct
+ * attribution (design D3/D4). Across the plugin RPC boundary host failures
+ * arrive as plain `{ type, message }` objects, not Error instances: a deny rule
+ * or a rejection-with-feedback arrives as `Tool.Error` carrying the host's
+ * reason; a plain decline (including a headless auto-rejection) stays a
+ * host-side defect and arrives as `rpc.internal`. Rethrowing (never returning
+ * output) keeps the failure a failed tool call instead of ending the model step.
+ */
+function assertFailureToError(name: string, err: unknown): Error {
+  const e = err as { type?: unknown; message?: unknown } | null;
+  const type = typeof e?.type === "string" ? e.type : "";
+  const message =
+    typeof e?.message === "string" && e.message
+      ? e.message
+      : typeof err === "string" && err
+        ? err.slice(0, 200)
+        : "no reason given";
+  if (type === "Tool.Error") {
+    return new Error(
+      `ctx tool "${name}" was refused by your opencode permission rules for ` +
+        `"${PERMISSION_ACTION}" (${message}). This is a host permission denial, ` +
+        `not a context-mode policy refusal.`,
+    );
+  }
+  if (type === "rpc.internal") {
+    return new Error(
+      `User declined ctx tool "${name}" at the permission prompt (or the host ` +
+        `could not evaluate the request). The tool did not run.`,
+    );
+  }
+  return new Error(
+    `ctx tool "${name}" could not check your host permission rules (${message}); ` +
+      `refusing to run. This is a context-mode fail-closed decision.`,
+  );
+}
+
+/**
+ * Layer 2 of the destructive-tool policy (tighten-only). Without pre-approval
+ * the tool never runs and host rules are not consulted — host rules cannot
+ * loosen context-mode's default refusal, and under the default agent ruleset
+ * (which allows everything) an unconditional assert would silently allow.
+ * With pre-approval, the user's `context-mode` rules are evaluated: deny
+ * blocks, ask prompts, allow (or the default-agent wildcard) resolves and the
+ * tool runs. Any assert failure refuses fail-closed.
+ */
+async function guardDestructiveTool(
+  ctx: Plugin.Context,
+  name: string,
+  sessionID: Session.ID,
+): Promise<void> {
+  if (!DESTRUCTIVE_TOOLS.has(name)) return;
+  if (!destructivePolicyAllows(name)) {
+    // Context-mode-owned refusal — layer 1. Surfaced as a failed tool call
+    // attributed to context-mode policy, never to a host permission denial.
+    throw new Error(
+      `ctx tool "${name}" is disabled by context-mode policy. This is a ` +
+        `context-mode decision, not a host permission denial: context-mode ` +
+        `refuses destructive tools by default. Set ` +
+        `CONTEXT_MODE_ALLOW_DESTRUCTIVE=1 to pre-approve it; host ` +
+        `"${PERMISSION_ACTION}" permission rules can still tighten that.`,
+    );
+  }
+  // Hosts predating the assertion feature (before #54930) expose no rule
+  // surface for plugin tools, so pre-approval is the whole policy there —
+  // matching "pre-approved + no rules -> run" rather than failing closed
+  // against a missing API.
+  if (typeof ctx.permission?.assert !== "function") return;
+  try {
+    await ctx.permission.assert({
+      action: PERMISSION_ACTION,
+      resources: [name],
+      // Persist an "always allow" reply for THIS tool only: a wildcard save
+      // would silently approve future ask prompts for every other
+      // context-mode tool (saved rules win over config ask, last match wins).
+      save: [name],
+      sessionID,
+    });
+  } catch (err) {
+    throw assertFailureToError(name, err);
+  }
 }
 
 /**
@@ -268,17 +366,11 @@ export async function setupV2(ctx: Plugin.Context): Promise<Plugin.Cleanup> {
         description: t.description,
         input: z.object(zod3ShapeToV4(extractShape(t.inputSchema))),
         execute: async (input, toolCtx) => {
-          if (!destructivePolicyAllows(t.name)) {
-            // Context-mode-owned refusal — the v2 host cannot gate plugin tools
-            // per call, so this decision is ours. Surfaced as a failed tool call
-            // attributed to context-mode policy, not a host permission denial.
-            throw new Error(
-              `ctx tool "${t.name}" is disabled by context-mode policy. This is a ` +
-                `context-mode decision, not a host permission denial: the v2 host does ` +
-                `not gate plugin tools per call, so context-mode refuses destructive ` +
-                `tools by default. Set CONTEXT_MODE_ALLOW_DESTRUCTIVE=1 to enable.`,
-            );
-          }
+          // Layered destructive-tool gate: context-mode's default refusal
+          // first; with env-var pre-approval the user's host `context-mode`
+          // permission rules are consulted (tighten-only). All refusals
+          // surface as failed tool calls with correct attribution.
+          await guardDestructiveTool(ctx, t.name, toolCtx.sessionID);
           const project = await resolveDir(toolCtx.sessionID);
           // t.run re-parses with the authoritative v3 schema and throws on a
           // schema failure or an isError handler result; the rejection surfaces to
