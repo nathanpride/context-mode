@@ -44,3 +44,10 @@ context-mode-guidance-*/
 tools/pricing/litellm-catalog.json
 /.cocoindex_code/
 /.kilo/
+
+# OpenSpec planning artifacts — live in the private store (~/openspec/context-mode), not the code repo
+openspec/
+
+# OpenSpec workflow tooling (CLI-generated, personal workflow — specs live in the private store)
+.claude/commands/
+.claude/skills/openspec-*/
