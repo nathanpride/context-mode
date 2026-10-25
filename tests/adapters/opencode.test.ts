@@ -1394,6 +1394,156 @@ describe("OpenCode v2 setup mouth", () => {
       }
     });
 
+    it("asserts the context-mode action with the tool name as resource when pre-approved", async () => {
+      const dir = join(tempDir, "destr-assert-shape");
+      const m = await setupV2For(dir);
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        const core = await getCore({ platform: "opencode", loadScopeDir: dir });
+        const coreTool = core.getTools().find((t: any) => t.name === "ctx_purge")!;
+        const origRun = coreTool.run;
+        coreTool.run = async () => "purge-ran";
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        try {
+          const purge = m.tools.find((t) => t.name === "purge")!;
+          await purge.execute({}, { sessionID: "s-shape" });
+          expect(m.permissionAssertCalls).toEqual([
+            {
+              action: "context-mode",
+              resources: ["ctx_purge"],
+              save: ["*"],
+              sessionID: "s-shape",
+            },
+          ]);
+        } finally {
+          coreTool.run = origRun;
+          if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+          else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+        }
+      } finally {
+        await m.cleanup();
+      }
+    });
+
+    it("a deny rule blocks a pre-approved tool and the tool never runs", async () => {
+      const dir = join(tempDir, "destr-deny-rule");
+      const m = await setupV2For(dir);
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        const core = await getCore({ platform: "opencode", loadScopeDir: dir });
+        const coreTool = core.getTools().find((t: any) => t.name === "ctx_purge")!;
+        const origRun = coreTool.run;
+        coreTool.run = async () => {
+          throw new Error("MUST NOT RUN: denied by host rule");
+        };
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        m.setPermissionAssertBehavior("blocked");
+        try {
+          const purge = m.tools.find((t) => t.name === "purge")!;
+          // Refusal attributed to the user's rule, distinct from the
+          // context-mode-policy wording (D3).
+          await expect(purge.execute({}, { sessionID: "s-deny" })).rejects.toThrow(
+            /refused by your opencode permission rules/,
+          );
+          await expect(purge.execute({}, { sessionID: "s-deny" })).rejects.toThrow(
+            /host permission denial/,
+          );
+          expect(m.permissionAssertCalls.length).toBe(2);
+        } finally {
+          coreTool.run = origRun;
+          if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+          else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+        }
+      } finally {
+        await m.cleanup();
+      }
+    });
+
+    it("a decline at the prompt surfaces as a failed tool call, not a run", async () => {
+      const dir = join(tempDir, "destr-decline");
+      const m = await setupV2For(dir);
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        const core = await getCore({ platform: "opencode", loadScopeDir: dir });
+        const coreTool = core.getTools().find((t: any) => t.name === "ctx_purge")!;
+        const origRun = coreTool.run;
+        coreTool.run = async () => {
+          throw new Error("MUST NOT RUN: declined");
+        };
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        m.setPermissionAssertBehavior("declined");
+        try {
+          const purge = m.tools.find((t) => t.name === "purge")!;
+          // A plain Error rejection = failed tool call; the model step
+          // continues (D4). The promise rejects rather than hanging.
+          await expect(purge.execute({}, { sessionID: "s-decline" })).rejects.toThrow(
+            /User declined ctx tool "ctx_purge"/,
+          );
+        } finally {
+          coreTool.run = origRun;
+          if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+          else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+        }
+      } finally {
+        await m.cleanup();
+      }
+    });
+
+    it("the layer-1 policy refusal never consults host rules", async () => {
+      const m = await setupV2For(join(tempDir, "destr-layer1-noassert"));
+      try {
+        const purge = m.tools.find((t) => t.name === "purge")!;
+        await expect(purge.execute({}, { sessionID: "s-l1" })).rejects.toThrow(
+          /disabled by context-mode policy/,
+        );
+        expect(m.permissionAssertCalls).toHaveLength(0);
+      } finally {
+        await m.cleanup();
+      }
+    });
+
+    it("non-destructive tools never trigger an assertion", async () => {
+      const m = await setupV2For(join(tempDir, "destr-nonassert"));
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        const stats = m.tools.find((t) => t.name === "stats")!;
+        await stats.execute({}, { sessionID: "s-nonassert" });
+        expect(m.permissionAssertCalls).toHaveLength(0);
+      } finally {
+        if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+        else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+        await m.cleanup();
+      }
+    });
+
+    it("hosts without a permission.assert API still run pre-approved tools", async () => {
+      const dir = join(tempDir, "destr-oldhost");
+      const m = await setupV2For(dir);
+      const prev = process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+      try {
+        // Hosts predating #54930 expose no assertion surface: pre-approval
+        // alone must run the tool (feature-detect path), not fail closed.
+        delete m.ctx.permission;
+        const core = await getCore({ platform: "opencode", loadScopeDir: dir });
+        const coreTool = core.getTools().find((t: any) => t.name === "ctx_purge")!;
+        const origRun = coreTool.run;
+        coreTool.run = async () => "purge-ran-oldhost";
+        process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = "1";
+        try {
+          const purge = m.tools.find((t) => t.name === "purge")!;
+          const res = await purge.execute({}, { sessionID: "s-old" });
+          expect(res.content).toBe("purge-ran-oldhost");
+        } finally {
+          coreTool.run = origRun;
+          if (prev === undefined) delete process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE;
+          else process.env.CONTEXT_MODE_ALLOW_DESTRUCTIVE = prev;
+        }
+      } finally {
+        await m.cleanup();
+      }
+    });
+
     it("does not gate non-destructive tools under the default policy", async () => {
       const { tools, cleanup } = await setupV2For(join(tempDir, "destr-nongate"));
       try {
