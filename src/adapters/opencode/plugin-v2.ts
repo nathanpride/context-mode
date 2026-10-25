@@ -61,7 +61,8 @@ const DESTRUCTIVE_TOOLS = new Set(["ctx_purge", "ctx_upgrade"]);
 
 /**
  * Host permission action namespace for context-mode rules (design D1):
- * `permissions: { "context-mode": { "ctx_purge": "deny" | "ask" | "allow" } }`.
+ * `{ "action": "context-mode", "resource": "ctx_purge", "effect": "deny" }`
+ * entries in the config `permissions` array.
  */
 const PERMISSION_ACTION = "context-mode";
 
@@ -90,7 +91,12 @@ function destructivePolicyAllows(name: string): boolean {
 function assertFailureToError(name: string, err: unknown): Error {
   const e = err as { type?: unknown; message?: unknown } | null;
   const type = typeof e?.type === "string" ? e.type : "";
-  const message = typeof e?.message === "string" && e.message ? e.message : "no reason given";
+  const message =
+    typeof e?.message === "string" && e.message
+      ? e.message
+      : typeof err === "string" && err
+        ? err.slice(0, 200)
+        : "no reason given";
   if (type === "Tool.Error") {
     return new Error(
       `ctx tool "${name}" was refused by your opencode permission rules for ` +
