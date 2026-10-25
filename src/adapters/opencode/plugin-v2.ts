@@ -145,7 +145,10 @@ async function guardDestructiveTool(
     await ctx.permission.assert({
       action: PERMISSION_ACTION,
       resources: [name],
-      save: ["*"],
+      // Persist an "always allow" reply for THIS tool only: a wildcard save
+      // would silently approve future ask prompts for every other
+      // context-mode tool (saved rules win over config ask, last match wins).
+      save: [name],
       sessionID,
     });
   } catch (err) {

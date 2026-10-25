@@ -260,7 +260,7 @@ Rule surface — add entries to the `permissions` array in your opencode config 
 ]
 ```
 
-Replying "always allow" at an `ask` prompt saves one `{ "action": "context-mode", "resource": "*", "effect": "allow" }` rule, after which the tool runs without prompting. Hosts predating #54930 have no rule surface for plugin tools: there, the env var alone decides. The CLI (`context-mode upgrade`) remains the supported upgrade/purge path.
+Replying "always allow" at an `ask` prompt saves a `{ "action": "context-mode", "resource": "<that tool>", "effect": "allow" }` rule — scoped to the tool you approved, never a wildcard — after which that tool runs without prompting. A config `deny` always outranks a saved allow. Hosts predating #54930 have no rule surface for plugin tools: there, the env var alone decides. The CLI (`context-mode upgrade`) remains the supported upgrade/purge path.
 
 **Upgrade / key migration:** `context-mode upgrade` resolves the target in this order:
 1. explicit `--v2` / `--opencode2` flag → V2

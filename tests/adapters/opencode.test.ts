@@ -1411,7 +1411,7 @@ describe("OpenCode v2 setup mouth", () => {
             {
               action: "context-mode",
               resources: ["ctx_purge"],
-              save: ["*"],
+              save: ["ctx_purge"],
               sessionID: "s-shape",
             },
           ]);
